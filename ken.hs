@@ -310,81 +310,81 @@ check (BaseAST (Array xs)) env = do
 
 type Operator = (Type, Token) -> (Type, Token) -> (Type, Token)
 
--- Next step to improve this is to typeclass Tokens
-numericOperator :: (Int -> Int -> Int) -> (Float -> Float -> Float) -> Operator
-numericOperator f _ (IntegerType, IntegerT x) (IntegerType, IntegerT y)
-    = (IntegerType, IntegerT $ f x y)
-numericOperator _ f (FloatType, FloatT x) (FloatType, FloatT y)
-    = (FloatType, FloatT $ f x y)
-numericOperator f g (ArrayType t, ArrayT xs) y = (ArrayType t, ArrayT $ map snd xs'')
-    where
-        xs' = map (t,) xs
-        xs'' = map (\x -> numericOperator f g x y) xs'
-numericOperator f g x (ArrayType t, ArrayT ys) = (ArrayType t, ArrayT $ map snd ys'')
-    where
-        ys' = map (t,) ys
-        ys'' = map (numericOperator f g x) ys'
-
-operators :: Map.Map String Operator
+operators :: Map.Map (String, Type, Type) Instr
 operators =
     Map.fromList
-        [("+", numericOperator (+) (+))
-        ,("*", numericOperator (*) (*))
+        [(("+", IntegerType, IntegerType), IAddInstr)
+        ,(("*", IntegerType, IntegerType), IAddInstr)
         ]
 
-typedToken :: TypedAST -> (Type, Token)
-typedToken (TypedAST t (Literal x)) = (t, x)
+typedASTType :: TypedAST -> Type
+typedASTType (TypedAST t _) = t
 
-type EnvMap = Map.Map String (Type, Token)
+type EnvMap = Map.Map Var Token
 type Env = [EnvMap]
 
-interpret :: TypedAST -> Env -> (TypedAST, Env)
-interpret (TypedAST _ (Ident (IdentT x))) env = 
-    (TypedAST t (Literal tok), env)
-    where (t, tok) = fromJust $ getEnv env x
-interpret (TypedAST t (Array xs)) env =
-    (TypedAST t (Literal (ArrayT xs'')), env')
-    where
-        (xs', envs) = unzip $ map (`interpret` env) xs
-        xs'' = map (snd . typedToken) xs'
-        env' = foldl1 mergeEnv envs
-interpret (TypedAST _ (Expr x@(TypedAST _ (Ident (IdentT ident)))
-                       AssignmentT y)) env =
-    (TypedAST yt (Literal tok), env')
-    where
-        (x', _) = interpret x env
-        (y'@(TypedAST yt (Literal tok)), yEnvH:yEnvT) = interpret y env
-        env' = Map.insert ident (yt, tok) yEnvH:yEnvT
+data Var = Label Int | IdentV String
+    deriving (Eq, Show, Ord)
+nextVar :: Var -> Var
+nextVar (Label v) = Label $ v + 1
 
-interpret (TypedAST _ (Expr x (OperatorT op) y)) env =
-    (TypedAST t (Literal z), env')
-    where
-        (x', xEnv) = interpret x env
-        x'' = typedToken x'
-        (y', yEnv) = interpret y env
-        y'' = typedToken y'
-        env' = mergeEnv xEnv yEnv
-        (t, z) = (operators Map.! op) x'' y''
-interpret other env = (other, env)
+data Instr = AliasInstr | CallInstr | IAddInstr
+    deriving Show
+data SSA = Noop | Copy Var Token | Assign Var Instr [Var]
+    deriving Show
 
--- data SSA = SSA ()
+
+--                                    ret  next
+makeSSA :: TypedAST -> Var -> ([SSA], Var, Var)
+makeSSA (TypedAST _ (Literal tok)) var = 
+    ([Copy var tok], var, nextVar var)
+makeSSA (TypedAST _ (Ident (IdentT x))) var = 
+    ([Noop], IdentV x, var)
+makeSSA (TypedAST t (Array xs)) var = undefined
+makeSSA (TypedAST _ (Expr (TypedAST _ (Ident (IdentT x)))
+                       AssignmentT y)) var =
+    (Assign ident AliasInstr [ret]:ySSA, ident, next)
+    where
+        ident = IdentV x
+        (ySSA, ret, next) = makeSSA y var
+makeSSA (TypedAST _ (Expr x (OperatorT op) y)) var =
+    (Assign next' instr [xRet, yRet]:ySSA ++ xSSA, next', nextVar next')
+    where
+        (xSSA, xRet, next) = makeSSA x var
+        (ySSA, yRet, next') = makeSSA y next
+        xt = typedASTType x
+        yt = typedASTType y
+        instr = operators Map.! (op, xt, yt)
+
+interpret :: (Var, EnvMap) -> SSA -> (Var, EnvMap)
+interpret (var, env) Noop = (var, env)
+interpret (_, env) (Copy var value) = (var, env')
+    where env' = Map.insert var value env
+interpret (_, env) (Assign var IAddInstr [xv, yv]) = (var, env')
+    where
+        (IntegerT x) = env Map.! xv
+        (IntegerT y) = env Map.! yv
+        z = IntegerT $ x + y
+        env' = Map.insert var z env
+        
+
 -- data ASM = ASM ()
 
-showResult :: TypedAST -> String
-showResult (TypedAST _ (Literal (IntegerT x))) = show x
-showResult (TypedAST _ (Literal (FloatT x)))   = show x
-showResult (TypedAST _ (Literal (StringT x)))  = show x
-showResult (TypedAST t (Literal (ArrayT xs)))  =
-    unwords $ map (showResult . TypedAST t . Literal) xs
+showResult :: Token -> String
+showResult (IntegerT x) = show x
+showResult (FloatT x)   = show x
+showResult (StringT x)  = show x
+showResult (ArrayT xs)  = undefined
 
 emptySimpleEnv :: SimpleEnv = [Map.empty]
 emptyEnv :: Env = [Map.empty]
 
-ivy :: String -> SimpleEnv -> Env -> Maybe (TypedAST, SimpleEnv, Env)
-ivy input simpleEnv env = do
+ken :: String -> SimpleEnv -> Maybe Token
+ken input simpleEnv = do
     (ast, simpleEnv') <- ((`check` simpleEnv) <=< parse <=< tokens <=< lexemes) input
-    let (result, env') = interpret ast env
-    Just (result, simpleEnv', env')
+    let (ssa, _, _) = makeSSA ast (Label 0)
+    let (var, env) = foldl interpret (Label 0, Map.empty) (reverse ssa)
+    Map.lookup var env
 
 prompt :: String -> IO String
 prompt s = do
@@ -393,11 +393,11 @@ prompt s = do
     getLine
 
 main :: IO ()
-main = loop emptySimpleEnv emptyEnv
+main = loop emptySimpleEnv
     where
-        loop simpleEnv env = do
+        loop simpleEnv = do
             line <- prompt " ; "
-            let Just (ast, simpleEnv', env') = ivy line simpleEnv env
-            _ <- putStrLn $ showResult ast
-            loop simpleEnv' env'
+            let Just result = ken line simpleEnv
+            _ <- putStrLn $ showResult result
+            loop emptySimpleEnv
 
