@@ -366,7 +366,44 @@ interpret (_, env) (Assign var IAddInstr [xv, yv]) = (var, env')
         (IntegerT y) = env Map.! yv
         z = IntegerT $ x + y
         env' = Map.insert var z env
-        
+
+type Line = String
+type Registers = Map.Map String (Maybe Var)
+
+nextAvailable :: Registers -> String
+nextAvailable = fromJust . Map.foldrWithKey f Nothing
+    where
+        f k Nothing Nothing = Just k
+        f _ _ acc = acc
+
+lookupKey :: Eq v => v -> Map.Map k v -> [k]
+lookupKey val = Map.foldrWithKey go [] where
+    go key value found =
+        if value == val
+        then key:found
+        else found
+
+compileToken :: Token -> String
+compileToken (IntegerT x) = show x
+
+compile :: (Registers, [Line]) -> SSA -> (Registers, [Line])
+compile (reg, lines) Noop = (reg, "":lines)
+compile (reg, lines) (Copy var tok) =
+    (reg', ("    mov " ++ nextReg ++ ", " ++ value):lines)
+    where
+        nextReg = nextAvailable reg
+        reg' = Map.adjust (const $ Just var) nextReg reg
+        value = compileToken tok
+compile (reg, lines) (Assign var IAddInstr [xv, yv]) =
+    (reg', (reverse
+            ["    mov " ++ zr ++ ", " ++ xr
+            ,"    add " ++ zr ++ ", " ++ yr])
+           ++ lines)
+    where
+        xr = head $ lookupKey (Just xv) reg
+        yr = head $ lookupKey (Just yv) reg
+        zr = nextAvailable reg
+        reg' = Map.adjust (const $ Just var) zr reg
 
 -- data ASM = ASM ()
 
@@ -379,12 +416,33 @@ showResult (ArrayT xs)  = undefined
 emptySimpleEnv :: SimpleEnv = [Map.empty]
 emptyEnv :: Env = [Map.empty]
 
-ken :: String -> SimpleEnv -> Maybe Token
+defaultRegisters =
+    Map.fromList [("rax", Nothing)
+                 ,("rbx", Nothing)
+                 ,("rcx", Nothing)
+                 ,("rdx", Nothing)
+                 ,("rdi", Nothing)
+                 ,("rsi", Nothing)
+                 ,("r8",  Nothing)
+                 ,("r9",  Nothing)
+                 ,("r10", Nothing)
+                 ,("r11", Nothing)
+                 ,("r12", Nothing)
+                 ,("r13", Nothing)
+                 ,("r14", Nothing)
+                 ,("r15", Nothing)
+                 ]
+
+ken :: String -> SimpleEnv -> Maybe [Line]
 ken input simpleEnv = do
     (ast, simpleEnv') <- ((`check` simpleEnv) <=< parse <=< tokens <=< lexemes) input
     let (ssa, _, _) = makeSSA ast (Label 0)
-    let (var, env) = foldl interpret (Label 0, Map.empty) (reverse ssa)
-    Map.lookup var env
+    let ssa' = reverse ssa
+    -- let (var, env) = foldl interpret (Label 0, Map.empty) ssa'
+    -- Map.lookup var env
+    let (reg, lines) = foldl compile (defaultRegisters, []) ssa'
+    let lines' = reverse lines
+    Just lines'
 
 prompt :: String -> IO String
 prompt s = do
@@ -398,6 +456,6 @@ main = loop emptySimpleEnv
         loop simpleEnv = do
             line <- prompt " ; "
             let Just result = ken line simpleEnv
-            _ <- putStrLn $ showResult result
+            _ <- putStrLn $ foldl1 (++) $ map (++"\n") result
             loop emptySimpleEnv
 
