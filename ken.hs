@@ -3,7 +3,8 @@ import Control.Monad
 import Data.Char (isDigit, isAlpha, isAlphaNum, isSpace)
 import Data.Maybe (fromMaybe, fromJust)
 import qualified Data.Map as Map
-import System.IO (hFlush, stdout)
+import System.IO
+import qualified System.Environment as Environment
 
 
 -- Consumer ADT
@@ -30,6 +31,12 @@ instance Alternative (Consumer i) where
 
 anyC :: (a -> Consumer i o) -> [a] -> Consumer i o
 anyC f xs = foldl1 (<|>) (map f xs)
+
+optC :: Consumer i o -> Consumer i (Maybe o)
+optC lexer@(Consumer l) = Consumer $ \input ->
+    case l input of
+        Just (x, input') -> Just (Just x, input)
+        Nothing -> Just (Nothing, input)
 
 starC :: Consumer i o -> Consumer i [o]
 starC lexer@(Consumer l) = Consumer $ \input ->
@@ -110,7 +117,7 @@ stringValL = f <$> charL '"' <*> starC (notCharL '"') <*> charL '"'
     where f start contents end = StringL $ [start] ++ contents ++ [end]
 
 seperatorL :: Lexer Lexeme
-seperatorL = SeperatorL <$> anyC stringL ["(", ")", "<-"]
+seperatorL = SeperatorL <$> anyC stringL ["(", ")", "<-", ";"]
 
 lexeme :: Lexer Lexeme
 lexeme =
@@ -136,6 +143,7 @@ data Token
     | OpenParenT
     | CloseParenT
     | AssignmentT
+    | EndStatementT
     | FloatT Float
     | StringT String
     | OperatorT String
@@ -158,6 +166,7 @@ evaluate (IdentL s)        = Just $ IdentT s
 evaluate (SeperatorL "(")  = Just OpenParenT
 evaluate (SeperatorL ")")  = Just CloseParenT
 evaluate (SeperatorL "<-") = Just AssignmentT
+evaluate (SeperatorL ";")  = Just EndStatementT
 evaluate _                 = Nothing
 
 tokens :: [Lexeme] -> Maybe [Token]
@@ -167,7 +176,8 @@ tokens = traverse evaluate
 -- Parser
 
 data AST a
-    = Literal Token
+    = EmptyAST
+    | Literal Token
     | Ident Token
     | Array [a]
     | Expr a Token a
@@ -222,6 +232,7 @@ parenExprP = tokenP OpenParenT *> baseASTP <* tokenP CloseParenT
 assignmentP :: Parser BaseAST
 assignmentP = BaseAST <$> (Expr <$> identP <*> tokenP AssignmentT <*> baseASTP)
 
+baseASTP :: Parser BaseAST
 baseASTP =
     assignmentP
     <|> exprP
@@ -249,7 +260,8 @@ getEnv :: (Ord a) => [Map.Map a b] -> a -> Maybe b
 getEnv env k = foldl (<|>) Nothing $ map (Map.lookup k) env
 
 data Type
-    = IntegerType
+    = NeverType
+    | IntegerType
     | FloatType
     | StringType
     | OperatorType Type Type Type
@@ -275,6 +287,8 @@ deArray (ArrayType t) = t
 deArray t             = t
 
 check :: BaseAST -> SimpleEnv -> Maybe (TypedAST, SimpleEnv)
+check (BaseAST EmptyAST) env =
+    Just (TypedAST NeverType EmptyAST, env)
 check (BaseAST (Literal tok@(IntegerT _))) env =
     Just (TypedAST IntegerType (Literal tok), env)
 check (BaseAST (Literal tok@(FloatT _))) env =
@@ -336,6 +350,8 @@ data SSA = Noop | Copy Var Token | Assign Var Instr [Var]
 
 --                                    ret  next
 makeSSA :: TypedAST -> Var -> ([SSA], Var, Var)
+makeSSA (TypedAST _ EmptyAST) var = 
+    ([Noop], var, var)
 makeSSA (TypedAST _ (Literal tok)) var = 
     ([Copy var tok], var, nextVar var)
 makeSSA (TypedAST _ (Ident (IdentT x))) var = 
@@ -356,16 +372,16 @@ makeSSA (TypedAST _ (Expr x (OperatorT op) y)) var =
         yt = typedASTType y
         instr = operators Map.! (op, xt, yt)
 
-interpret :: (Var, EnvMap) -> SSA -> (Var, EnvMap)
-interpret (var, env) Noop = (var, env)
-interpret (_, env) (Copy var value) = (var, env')
-    where env' = Map.insert var value env
-interpret (_, env) (Assign var IAddInstr [xv, yv]) = (var, env')
-    where
-        (IntegerT x) = env Map.! xv
-        (IntegerT y) = env Map.! yv
-        z = IntegerT $ x + y
-        env' = Map.insert var z env
+-- interpret :: (Var, EnvMap) -> SSA -> (Var, EnvMap)
+-- interpret (var, env) Noop = (var, env)
+-- interpret (_, env) (Copy var value) = (var, env')
+--     where env' = Map.insert var value env
+-- interpret (_, env) (Assign var IAddInstr [xv, yv]) = (var, env')
+--     where
+--         (IntegerT x) = env Map.! xv
+--         (IntegerT y) = env Map.! yv
+--         z = IntegerT $ x + y
+--         env' = Map.insert var z env
 
 type Line = String
 type Registers = Map.Map String (Maybe Var)
@@ -395,9 +411,9 @@ compile (reg, lines) (Copy var tok) =
         reg' = Map.adjust (const $ Just var) nextReg reg
         value = compileToken tok
 compile (reg, lines) (Assign var IAddInstr [xv, yv]) =
-    (reg', (reverse
-            ["    mov " ++ zr ++ ", " ++ xr
-            ,"    add " ++ zr ++ ", " ++ yr])
+    (reg', reverse
+           ["    mov " ++ zr ++ ", " ++ xr
+           ,"    add " ++ zr ++ ", " ++ yr]
            ++ lines)
     where
         xr = head $ lookupKey (Just xv) reg
@@ -433,16 +449,46 @@ defaultRegisters =
                  ,("r15", Nothing)
                  ]
 
-ken :: String -> SimpleEnv -> Maybe [Line]
-ken input simpleEnv = do
-    (ast, simpleEnv') <- ((`check` simpleEnv) <=< parse <=< tokens <=< lexemes) input
-    let (ssa, _, _) = makeSSA ast (Label 0)
-    let ssa' = reverse ssa
-    -- let (var, env) = foldl interpret (Label 0, Map.empty) ssa'
-    -- Map.lookup var env
-    let (reg, lines) = foldl compile (defaultRegisters, []) ssa'
-    let lines' = reverse lines
-    Just lines'
+asmPrefix :: [Line]
+asmPrefix =
+    ["default rel"
+    ,"bits 64"
+    ,""
+    ,"global _start"
+    ,""
+    ,"section .text"
+    ,""
+    ,"%include\"lib.s\""
+    ,""
+    ,"_start:"
+    ]
+
+asmSuffix :: [Line]
+asmSuffix = ["    call exit"]
+
+splitBy :: (Eq a) => a -> [a] -> [[a]]
+splitBy v = filter (not . null) . foldr f [[]]
+    where
+        f x acc | x == v = []:acc
+        f x (h:t) = (x:h):t
+
+ken :: String -> Maybe [Line]
+ken input = do
+    programTokens <- (tokens <=< lexemes) input
+    let programStatements = splitBy EndStatementT programTokens
+    (asm, _) <- foldM fold ([], emptySimpleEnv) programStatements
+    Just $ asmPrefix ++ asm ++ asmSuffix
+    where
+        fold :: ([Line], SimpleEnv) -> [Token] -> Maybe ([Line], SimpleEnv)
+        fold (lines, env) statement = do
+            (ast, env') <- ((`check` env) <=< parse) statement
+            let (ssa, _, _) = makeSSA ast (Label 0)
+            let ssa' = reverse ssa
+            -- let (var, env) = foldl interpret (Label 0, Map.empty) ssa'
+            -- Map.lookup var env
+            let (reg, lines) = foldl compile (defaultRegisters, []) ssa'
+            let lines' = reverse lines
+            Just (lines', env')
 
 prompt :: String -> IO String
 prompt s = do
@@ -450,12 +496,20 @@ prompt s = do
     hFlush stdout
     getLine
 
+-- main :: IO ()
+-- main = loop emptySimpleEnv
+--     where
+--         loop simpleEnv = do
+--             line <- prompt " ; "
+--             let Just result = ken line simpleEnv
+--             _ <- putStrLn $ foldl1 (++) $ map (++"\n") result
+--             loop emptySimpleEnv
+
 main :: IO ()
-main = loop emptySimpleEnv
-    where
-        loop simpleEnv = do
-            line <- prompt " ; "
-            let Just result = ken line simpleEnv
-            _ <- putStrLn $ foldl1 (++) $ map (++"\n") result
-            loop emptySimpleEnv
+main = do
+    [infile, outfile] <- Environment.getArgs
+    handle <- openFile infile ReadMode
+    contents <- hGetContents handle
+    let asm = fromJust $ ken contents
+    writeFile outfile $ unlines asm
 
