@@ -64,6 +64,7 @@ valC filter = Consumer f
 data Lexeme
     = FillerL
     | SeperatorL String
+    | KeywordL String
     | IntegerL String
     | FloatL String
     | StringL String
@@ -106,7 +107,11 @@ underscoreL = charL '_'
 identL :: Lexer Lexeme
 identL = f <$> (alphaL <|> underscoreL)
            <*> starC (alphaNumL <|> underscoreL)
-    where f start rest = IdentL $ start:rest
+    where
+        f start rest
+            | (start:rest) `elem` ["print", "let"] = KeywordL (start:rest)
+            | otherwise = IdentL $ start:rest
+
 
 floatL :: Lexer Lexeme
 floatL = f <$> plusC digitL <*> charL '.' <*> plusC digitL
@@ -144,6 +149,7 @@ data Token
     | CloseParenT
     | AssignmentT
     | EndStatementT
+    | KeywordPrintT
     | FloatT Float
     | StringT String
     | OperatorT String
@@ -158,16 +164,17 @@ safeRead s =
         _         -> Nothing
 
 evaluate :: Lexeme -> Maybe Token
-evaluate (IntegerL s)      = fmap IntegerT (safeRead s)
-evaluate (FloatL s)        = fmap FloatT (safeRead s)
-evaluate (StringL s)       = Just $ StringT $ init $ tail s
-evaluate (OperatorL s)     = Just $ OperatorT s
-evaluate (IdentL s)        = Just $ IdentT s
-evaluate (SeperatorL "(")  = Just OpenParenT
-evaluate (SeperatorL ")")  = Just CloseParenT
-evaluate (SeperatorL "<-") = Just AssignmentT
-evaluate (SeperatorL ";")  = Just EndStatementT
-evaluate _                 = Nothing
+evaluate (IntegerL s)       = fmap IntegerT (safeRead s)
+evaluate (FloatL s)         = fmap FloatT (safeRead s)
+evaluate (StringL s)        = Just $ StringT $ init $ tail s
+evaluate (OperatorL s)      = Just $ OperatorT s
+evaluate (IdentL s)         = Just $ IdentT s
+evaluate (SeperatorL "(")   = Just OpenParenT
+evaluate (SeperatorL ")")   = Just CloseParenT
+evaluate (SeperatorL "<-")  = Just AssignmentT
+evaluate (SeperatorL ";")   = Just EndStatementT
+evaluate (KeywordL "print") = Just KeywordPrintT
+evaluate _                  = Nothing
 
 tokens :: [Lexeme] -> Maybe [Token]
 tokens = traverse evaluate
@@ -180,6 +187,7 @@ data AST a
     | Literal Token
     | Ident Token
     | Array [a]
+    | Print a
     | Expr a Token a
     deriving (Show)
 
@@ -219,6 +227,9 @@ exprP = BaseAST <$> (Expr <$> (arrayP <|> parenExprP <|> identP <|> literalP)
                           <*> valC isOperator
                           <*> baseASTP)
 
+printP :: Parser BaseAST
+printP =  BaseAST . Print <$> (tokenP KeywordPrintT *> exprP)
+
 elementP :: Parser BaseAST
 elementP = parenExprP <|> literalP
 
@@ -235,6 +246,7 @@ assignmentP = BaseAST <$> (Expr <$> identP <*> tokenP AssignmentT <*> baseASTP)
 baseASTP :: Parser BaseAST
 baseASTP =
     assignmentP
+    <|> printP
     <|> exprP
     <|> arrayP
     <|> parenExprP
@@ -309,6 +321,9 @@ check (BaseAST (Expr x f@(OperatorT repr) y)) env = do
     poly <- Map.lookup repr operatorMap
     ft <- Map.lookup (deArray xt, deArray yt) poly
     Just (TypedAST ft (Expr x' f y'), env')
+check (BaseAST (Print x)) env = do
+    (x'@(TypedAST t _), env') <- check x env
+    return (TypedAST t (Print x'), env')
 check (BaseAST (Array xs)) env = do
     (xs', envs) <- mapAndUnzipM (`check` env) xs
     let xts = map extractType xs'
@@ -319,8 +334,6 @@ check (BaseAST (Array xs)) env = do
         extractType (TypedAST t _) = t
         foldEq (x:xs) = if all (==x) xs then Just x else Nothing
 
-
--- Interpreter (Temporary)
 
 type Operator = (Type, Token) -> (Type, Token) -> (Type, Token)
 
@@ -342,13 +355,16 @@ data Var = Label Int | IdentV String
 nextVar :: Var -> Var
 nextVar (Label v) = Label $ v + 1
 
-data Instr = AliasInstr | CallInstr | IAddInstr
+data Instr = AliasInstr | CallInstr | IAddInstr | IPrintInstr
     deriving Show
-data SSA = Noop | Copy Var Token | Assign Var Instr [Var]
+data SSA
+    = Noop
+    | Copy Var Token
+    | Assign Var Instr [Var]
     deriving Show
 
 
---                                    ret  next
+--                     curr           ret  next
 makeSSA :: TypedAST -> Var -> ([SSA], Var, Var)
 makeSSA (TypedAST _ EmptyAST) var = 
     ([Noop], var, var)
@@ -371,6 +387,11 @@ makeSSA (TypedAST _ (Expr x (OperatorT op) y)) var =
         xt = typedASTType x
         yt = typedASTType y
         instr = operators Map.! (op, xt, yt)
+makeSSA (TypedAST IntegerType (Print x )) var =
+    (Assign next IPrintInstr [x']:ssa, next, nextVar next)
+    where
+        (ssa, x', next) = makeSSA x var
+        xt = typedASTType x
 
 -- interpret :: (Var, EnvMap) -> SSA -> (Var, EnvMap)
 -- interpret (var, env) Noop = (var, env)
@@ -418,6 +439,17 @@ compile (reg, lines) (Assign var IAddInstr [xv, yv]) =
     where
         xr = head $ lookupKey (Just xv) reg
         yr = head $ lookupKey (Just yv) reg
+        zr = nextAvailable reg
+        reg' = Map.adjust (const $ Just var) zr reg
+compile (reg, lines) (Assign var IPrintInstr [xv]) =
+    (reg', reverse
+           ["    push rdi"
+           ,"    mov rdi, " ++ xr
+           ,"    call iprintln"
+           ,"    pop rdi"]
+           ++ lines)
+    where
+        xr = head $ lookupKey (Just xv) reg
         zr = nextAvailable reg
         reg' = Map.adjust (const $ Just var) zr reg
 
